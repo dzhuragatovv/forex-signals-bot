@@ -212,5 +212,38 @@ def main():
                 
         time.sleep(CHECK_INTERVAL)
 
+import threading
+from flask import Flask
+
+# Создаем минимальный веб-сервер для "обмана" Render
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "Бот сканера рынка активен и работает 24/7!"
+
+def run_flask():
+    # Render передает порт через переменную PORT, по умолчанию 8080
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
 if __name__ == '__main__':
-    main()
+    init_db()
+    
+    # 1. Запускаем фиктивный веб-сервер в отдельном фоновом потоке (threading)
+    t = threading.Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+    
+    # 2. Запускаем нашего Telegram-бота и сканер рынка
+    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start_command))
+    dp.add_handler(CallbackQueryHandler(button_handler))
+
+    updater.start_polling()
+    print("Бот и веб-сервер заглушка успешно запущены!")
+
+    # Запуск сканера рынка
+    market_scanner_loop(updater.bot)
