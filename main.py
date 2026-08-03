@@ -55,37 +55,36 @@ def start_cmd(message):
 
 # ==================== ПОЛУЧЕНИЕ КОТИРОВОК YAHOO FINANCE ====================
 def get_yahoo_klines(symbol, interval='5m', period='5d'):
-    """
-    Получение свечей через yfinance.
-    interval: '5m' для M5, '60m' для H1
-    """
-    try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(interval=interval, period=period)
-        
-        if df is None or df.empty:
-            return None
+    # Делаем 3 попытки получить данные, если Yahoo временно заблокирует запрос
+    for attempt in range(3):
+        try:
+            time.sleep(1)  # Небольшая пауза перед запросом
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(interval=interval, period=period)
             
-        df = df.copy()
-        df.rename(columns={
-            'Open': 'open', 'High': 'high', 'Low': 'low', 
-            'Close': 'close', 'Volume': 'volume'
-        }, inplace=True)
-        
-        # Часовой пояс переводим в UTC для надежности
-        if df.index.tz is None:
-            df.index = df.index.tz_localize('UTC')
-        else:
-            df.index = df.index.tz_convert('UTC')
+            if df is not None and not df.empty:
+                df = df.copy()
+                df.rename(columns={
+                    'Open': 'open', 'High': 'high', 'Low': 'low', 
+                    'Close': 'close', 'Volume': 'volume'
+                }, inplace=True)
+                
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize('UTC')
+                else:
+                    df.index = df.index.tz_convert('UTC')
+                    
+                if df['volume'].sum() == 0:
+                    df['volume'] = ((df['high'] - df['low']) * 100000).astype(int) + 1
+                    
+                return df[['open', 'high', 'low', 'close', 'volume']]
+                
+        except Exception as e:
+            print(f"⚠️ Попытка {attempt + 1}/3 не удалась для {symbol}: {e}")
+            time.sleep(5)  # Ждем 5 секунд перед повторной попыткой
             
-        # Yahoo Finance на форексе может отдавать нулевые объемы, формируем тиковый объем
-        if df['volume'].sum() == 0:
-            df['volume'] = ((df['high'] - df['low']) * 100000).astype(int) + 1
-            
-        return df[['open', 'high', 'low', 'close', 'volume']]
-    except Exception as e:
-        print(f"⚠️ Ошибка Yahoo Finance ({symbol}): {e}")
-        return None
+    print(f"❌ Не удалось получить данные по {symbol} после 3 попыток.")
+    return None
 
 # ==================== ЭКОНОМИЧЕСКИЙ КАЛЕНДАРЬ ====================
 def get_currency_by_country(country_code):
@@ -372,7 +371,7 @@ def broadcast_signal(bot, symbol, signal_type, price, photo_path, candle_time, r
         f"⏱ <b>Экспирация:</b> до <code>{exp_time}</code> (<b>на {exp_minutes} минут</b>)\n\n"
         f"📊 <b>Детали анализа:</b>\n{reasons_formatted}\n\n"
         f"🛡️ <i>Новостной фильтр: Активен</i>"
-    )
+    ).sleep
     
     for user_id in active_users:
         try:
@@ -415,7 +414,7 @@ def market_scanner_loop():
         except Exception as e:
             print(f"⚠️ Ошибка в сканере рынка: {e}")
 
-        time.sleep(30) # Проверяем каждые 30 секунд
+        time.sleep(60)  # Вместо 30
 
 # ==================== ЗАПУСК БОТА ====================
 if __name__ == "__main__":

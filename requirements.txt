@@ -1,9 +1,6 @@
-yfinance>=0.2.35
-python-telegram-bot==13.15
+pyTelegramBotAPI
+yfinance
 pandas
-ta
-requests
-mplfinance
+numpy
 matplotlib
-flask
-gunicorn
+requests
