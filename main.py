@@ -125,7 +125,7 @@ def fetch_economic_calendar():
                     })
             high_impact_news = news_list
             last_news_fetch_time = now_astana
-            print(f"[{now_astana.strftime('%H:%M:%S']}] Календарь новостей обновлен ({len(high_impact_news)} событий)")
+            print(f"[{now_astana.strftime('%H:%M:%S')}] Календарь новостей обновлен ({len(high_impact_news)} событий)")
     except Exception as e:
         print(f"⚠️ Предупреждение календаря: {e}")
 
