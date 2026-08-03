@@ -21,7 +21,12 @@ SYMBOLS = [
     'USDJPY=X',
     'AUDUSD=X',
     'USDCAD=X',
-    'EURGBP=X'
+    'EURGBP=X',
+    # Новые волатильные пары:
+    'GBPJPY=X',
+    'AUDJPY=X',
+    'EURJPY=X',
+    'GBPUSD=X'
 ]
 
 TIMEFRAME = '5m'
