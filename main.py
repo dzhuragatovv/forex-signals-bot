@@ -4,8 +4,8 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 import pandas as pd
+import numpy as np
 import yfinance as yf
-import ta
 import requests
 import mplfinance as mpf
 from flask import Flask
@@ -13,7 +13,7 @@ from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, CallbackContext
 
 # ==================== НАСТРОЙКИ ====================
-TELEGRAM_TOKEN = '8996178345:AAElh6CIkk08qqP_90RyiVgxHjWrBiftKso'  # Токен от @BotFather
+TELEGRAM_TOKEN = '8996178345:AAElh6CIkk08qqP_90RyiVgxHjWrBiftKso'  # Укажите ваш токен от @BotFather
 
 SYMBOLS = [
     'EURUSD=X',
@@ -31,7 +31,6 @@ DB_FILE = 'bot_users.db'
 
 # ==================== БАЗА ДАННЫХ ====================
 def init_db():
-    """Инициализация базы данных пользователей"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
@@ -89,7 +88,7 @@ def fetch_economic_calendar():
     to_time = now_utc.replace(hour=23, minute=59, second=59).strftime('%Y-%m-%dT%H:%M:%SZ')
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Origin': 'https://www.tradingview.com',
         'Referer': 'https://www.tradingview.com/'
     }
@@ -112,7 +111,7 @@ def fetch_economic_calendar():
             last_news_fetch_time = datetime.now()
             print(f"[{time.strftime('%H:%M:%S')}] Календарь новостей обновлен ({len(high_impact_news)} событий)")
     except Exception as e:
-        print(f"⚠️ Предупреждение: Не удалось загрузить новости (работаем без фильтра): {e}")
+        print(f"⚠️ Предупреждение: Не удалось загрузить новости: {e}")
 
 def is_news_time(symbol):
     if not high_impact_news:
@@ -130,9 +129,57 @@ def is_news_time(symbol):
                 return True
     return False
 
-# ==================== ТЕХНИЧЕСКИЙ АНАЛИЗ И ГРАФИКИ ====================
+# ==================== РАСЧЕТ VOLUME PROFILE & POC ====================
+def calculate_volume_profile(df, num_bins=30):
+    """Расчет уровня максимального объема POC и Value Area (VAH, VAL 70%)"""
+    min_price = df['low'].min()
+    max_price = df['high'].max()
+    
+    if max_price == min_price:
+        return None, None, None
+
+    bins = np.linspace(min_price, max_price, num_bins)
+    profile = np.zeros(len(bins) - 1)
+
+    for _, row in df.iterrows():
+        # Распределяем объем свечи по бинам в пределах ее диапазона [low, high]
+        c_low, c_high, vol = row['low'], row['high'], row['volume']
+        if c_high == c_low:
+            continue
+        idx = np.where((bins[:-1] >= c_low) & (bins[1:] <= c_high))[0]
+        if len(idx) > 0:
+            profile[idx] += vol / len(idx)
+        else:
+            mid = (c_low + c_high) / 2
+            closest_bin = np.digitize(mid, bins) - 1
+            closest_bin = max(0, min(closest_bin, len(profile) - 1))
+            profile[closest_bin] += vol
+
+    # Поиск POC (Point of Control)
+    poc_idx = np.argmax(profile)
+    poc_price = (bins[poc_idx] + bins[poc_idx + 1]) / 2
+
+    # Поиск Value Area (70% объема)
+    total_vol = np.sum(profile)
+    target_vol = total_vol * 0.70
+    
+    sorted_indices = np.argsort(profile)[::-1]
+    accum_vol = 0
+    va_indices = []
+    
+    for idx in sorted_indices:
+        accum_vol += profile[idx]
+        va_indices.append(idx)
+        if accum_vol >= target_vol:
+            break
+            
+    val_price = (bins[min(va_indices)] + bins[min(va_indices) + 1]) / 2
+    vah_price = (bins[max(va_indices)] + bins[max(va_indices) + 1]) / 2
+
+    return poc_price, vah_price, val_price
+
+# ==================== VSA И PRICE ACTION АНАЛИЗ ====================
 def get_forex_klines(symbol, period='2d', interval='5m'):
-    """Получение котировок из yfinance"""
     try:
         df = yf.download(symbol, period=period, interval=interval, progress=False)
         if df.empty:
@@ -141,71 +188,149 @@ def get_forex_klines(symbol, period='2d', interval='5m'):
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        return df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
+        df = df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
+        
+        # Если тиковый объем нулевой (бывает на Forex в yfinance), генерируем спредовый объем
+        if df['volume'].sum() == 0:
+            df['volume'] = (df['high'] - df['low']) * 100000
+
+        return df
     except Exception as e:
         print(f"Ошибка загрузки котировок {symbol}: {e}")
         return None
 
-def analyze_market(df):
-    df['rsi'] = ta.momentum.rsi(df['close'], window=14)
-    bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=1.8)
-    df['bb_high'] = bb.bollinger_hband()
-    df['bb_low'] = bb.bollinger_lband()
-    df['ema200'] = ta.trend.ema_indicator(df['close'], window=200)
+def analyze_vsa(df):
+    """VSA анализ свечей и профиля объемов"""
+    df = df.copy()
     
-    last = df.iloc[-2]
-    rsi_val, close_price = last['rsi'], last['close']
-    bb_h, bb_l = last['bb_high'], last['bb_low']
+    # Расчет метрик VSA
+    df['spread'] = df['high'] - df['low']
+    df['sma_spread'] = df['spread'].rolling(window=20).mean()
+    df['sma_vol'] = df['volume'].rolling(window=20).mean()
     
-    if rsi_val < 40 and close_price <= bb_l:
-        return "CALL (ВВЕРХ 🟢)", rsi_val, close_price
-    elif rsi_val > 60 and close_price >= bb_h:
-        return "PUT (ВНИЗ 🔴)", rsi_val, close_price
-        
-    return None, rsi_val, close_price
+    df['close_ratio'] = (df['close'] - df['low']) / df['spread'].replace(0, np.nan)
+    df['vol_rel'] = df['volume'] / df['sma_vol'].replace(0, np.nan)
 
-def generate_chart(df, symbol, signal_type):
-    df_plot = df.iloc[-40:].copy()
+    last = df.iloc[-2]
+    close, open_p = last['close'], last['open']
+    
+    poc, vah, val = calculate_volume_profile(df.iloc[-80:])
+    
+    reasons = []
+    signal = None
+
+    # Метрики закрытой свечи
+    spread = last['spread']
+    sma_spread = last['sma_spread']
+    vol_rel = last['vol_rel']
+    close_ratio = last['close_ratio']
+
+    # 1. Stopping Volume (Остановка падения - Накопление)
+    if close < open_p and vol_rel > 1.8 and close_ratio > 0.5:
+        signal = "CALL (ВВЕРХ 🟢)"
+        reasons.append(f"**Stopping Volume**: Медвежья свеча с аномальным объемом ({vol_rel:.1f}x от нормы).")
+        reasons.append("Крупный игрок встретил продажи лимитными бай-ордерами (откуп).")
+        reasons.append(f"Закрытие в верхней части свечи (Ratio: {close_ratio:.2f}).")
+
+    # 2. No Supply (Тест предложения - Нет продавцов)
+    elif close < open_p and spread < (0.7 * sma_spread) and vol_rel < 0.65:
+        signal = "CALL (ВВЕРХ 🟢)"
+        reasons.append(f"**No Supply**: Узкий спред при крайне низком объеме ({vol_rel:.1f}x от нормы).")
+        reasons.append("Предложение на рынке иссякло (продавцы отсутствуют).")
+
+    # 3. Absorption / Stopping High (Поглощение на вершине / Остановка роста)
+    elif close > open_p and vol_rel > 1.8 and close_ratio < 0.5:
+        signal = "PUT (ВНИЗ 🔴)"
+        reasons.append(f"**Absorption High**: Бычья свеча с аномальным объемом ({vol_rel:.1f}x от нормы).")
+        reasons.append("Крупный продавец вставил лимитный барьер, цена не может расти.")
+        reasons.append(f"Закрытие в нижней части свечи (Ratio: {close_ratio:.2f}).")
+
+    # 4. No Demand (Тест спроса - Нет покупателей)
+    elif close > open_p and spread < (0.7 * sma_spread) and vol_rel < 0.65:
+        signal = "PUT (ВНИЗ 🔴)"
+        reasons.append(f"**No Demand**: Рост на очень узком спреде и слабом объеме ({vol_rel:.1f}x от нормы).")
+        reasons.append("Покупатели не поддерживают движение вверх.")
+
+    # Добавляем аргумент по Volume Profile POC/VAH/VAL
+    if signal and poc:
+        if abs(close - poc) / close < 0.0008:
+            reasons.append(f"📍 Цена находится прямо на **POC** (Максимальный объем дня: {poc:.5f}).")
+        elif abs(close - vah) / close < 0.0008:
+            reasons.append(f"📍 Отбой от верхней границы зоны стоимости **VAH** ({vah:.5f}).")
+        elif abs(close - val) / close < 0.0008:
+            reasons.append(f"📍 Отбой от нижней границы зоны стоимости **VAL** ({val:.5f}).")
+
+    return signal, close, reasons, poc, vah, val
+
+# ==================== ОФОРМЛЕНИЕ ГРАФИКА TRADINGVIEW + VSA ====================
+def generate_chart(df, symbol, signal_type, poc, vah, val):
+    df_plot = df.iloc[-60:].copy()
     clean_symbol = symbol.replace('=X', '')
+
+    market_colors = mpf.make_marketcolors(
+        up='#089981',
+        down='#F23645',
+        edge={'up': '#089981', 'down': '#F23645'},
+        wick={'up': '#089981', 'down': '#F23645'},
+        volume={'up': '#089981', 'down': '#F23645'}
+    )
     
-    addplots = [
-        mpf.make_addplot(df_plot['bb_high'], color='gray', linestyle='--'),
-        mpf.make_addplot(df_plot['bb_low'], color='gray', linestyle='--'),
-        mpf.make_addplot(df_plot['ema200'], color='orange', width=1.5),
-        mpf.make_addplot(df_plot['rsi'], panel=1, color='purple', ylabel='RSI (14)'),
-    ]
-    
-    style = mpf.make_mpf_style(base_mpf_style='nightclouds', rc={'font.size': 9})
+    tv_style = mpf.make_mpf_style(
+        marketcolors=market_colors,
+        facecolor='#131722',
+        edgecolor='#2A2E39',
+        figcolor='#131722',
+        gridcolor='#2A2E39',
+        gridstyle='--',
+        rc={'font.size': 9, 'axes.labelcolor': '#D1D4DC', 'xtick.color': '#D1D4DC', 'ytick.color': '#D1D4DC'}
+    )
+
     file_path = f"chart_{clean_symbol}.png"
-    
-    mpf.plot(
+
+    fig, axes = mpf.plot(
         df_plot,
         type='candle',
-        addplot=addplots,
-        volume=False,
-        style=style,
-        title=f"\n{clean_symbol} | 5m | {signal_type}",
-        savefig=file_path,
+        volume=True,
+        style=tv_style,
+        title=f"\n{clean_symbol} | 5m | VSA & Volume Profile",
+        savefig=dict(fname=file_path, dpi=150, bbox_inches='tight'),
+        returnfig=True,
         panel_ratios=(3, 1),
         figratio=(12, 7)
     )
+
+    ax = axes[0]
+    
+    # Нанесение линий Профиля Объема (POC, VAH, VAL)
+    if poc:
+        ax.axhline(y=poc, color='#FFD700', linestyle='-', linewidth=1.5, alpha=0.9, label='POC')
+    if vah:
+        ax.axhline(y=vah, color='#00BCD4', linestyle='--', linewidth=1.2, alpha=0.7, label='VAH')
+    if val:
+        ax.axhline(y=val, color='#00BCD4', linestyle='--', linewidth=1.2, alpha=0.7, label='VAL')
+
+    fig.savefig(file_path, dpi=150, bbox_inches='tight')
     return file_path
 
 # ==================== МАССОВАЯ РАССЫЛКА ====================
-def broadcast_signal(bot, symbol, signal_type, rsi, price, photo_path):
+def broadcast_signal(bot, symbol, signal_type, price, photo_path, candle_time, reasons):
     active_users = get_active_users()
     if not active_users:
-        print("Нет активных подписчиков для рассылки.")
         return
 
     clean_symbol = symbol.replace('=X', '')
+    exp_time_5m = (candle_time + timedelta(minutes=10)).strftime('%H:%M UTC')
+    
+    reasons_formatted = "\n".join([f"• {r}" for r in reasons])
+
     caption = (
-        f"🚨 <b>СИГНАЛ FOREX (БИНАРНЫЕ ОПЦИОНЫ)</b> 🚨\n\n"
-        f"<b>Валютная пара:</b> {clean_symbol}\n"
+        f"🚨 <b>СИГНАЛ VSA & VOLUME PROFILE</b> 🚨\n\n"
+        f"<b>Пара:</b> #{clean_symbol}\n"
         f"<b>Направление:</b> {signal_type}\n"
-        f"<b>Экспирация:</b> 5 - 10 минут\n"
-        f"<b>Текущая цена:</b> {price:.5f}\n"
-        f"<b>RSI:</b> {rsi:.2f}\n\n"
+        f"<b>Цена входа:</b> {price:.5f}\n"
+        f"⏱ <b>Время экспирации:</b> до <code>{exp_time_5m}</code> (на 5 минут)\n\n"
+        f"📊 <b>VSA & Объемный анализ:</b>\n"
+        f"{reasons_formatted}\n\n"
         f"🛡️ <i>Новостной фильтр: Чисто</i>"
     )
     
@@ -221,32 +346,37 @@ def broadcast_signal(bot, symbol, signal_type, rsi, price, photo_path):
                 set_user_status(user_id, 0)
             print(f"Ошибка отправки пользователю {user_id}: {e}")
             
-    print(f"[{time.strftime('%H:%M:%S')}] Сигнал {clean_symbol} отправлен {count}/{len(active_users)} пользователям")
+    print(f"[{time.strftime('%H:%M:%S')}] VSA-Сигнал {clean_symbol} отправлен {count}/{len(active_users)} пользователям")
     
     if os.path.exists(photo_path):
         os.remove(photo_path)
 
 # ==================== КОМАНДЫ БОТА И МЕНЮ ====================
+def get_main_keyboard(is_active=True):
+    if is_active:
+        button_status = InlineKeyboardButton("🛑 Остановить сигналы", callback_data='disable')
+    else:
+        button_status = InlineKeyboardButton("▶️ Включить сигналы", callback_data='enable')
+        
+    keyboard = [
+        [button_status],
+        [InlineKeyboardButton("📊 Статус подписки", callback_data='status')]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 def start_command(update: Update, context: CallbackContext):
     user = update.effective_user
     add_user(user.id, user.username)
     
-    keyboard = [
-        [InlineKeyboardButton("🔔 Включить сигналы", callback_data='enable'),
-         InlineKeyboardButton("🔕 Выключить сигналы", callback_data='disable')],
-        [InlineKeyboardButton("📊 Статус подписки", callback_data='status')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
     welcome_text = (
         f"👋 <b>Добро пожаловать, {user.first_name}!</b>\n\n"
-        f"Этот бот сканирует рынок Forex (EURUSD, GBPUSD и др.) на таймфрейме 5 минут "
-        f"и присылает сигналы для бинарных опциональных сделок (экспирация 5–10 мин).\n\n"
-        f"Все сигналы подкрепляются анализом <b>RSI</b>, <b>Bollinger Bands</b>, <b>EMA 200</b> "
-        f"и встроенным <b>новостным фильтром</b>.\n\n"
-        f"Используйте кнопки ниже для управления подпиской:"
+        f"Этот бот сканирует рынок Forex по методике <b>VSA (Volume Spread Analysis)</b> "
+        f"и <b>Профилю Объема (POC / VAH / VAL)</b>.\n\n"
+        f"Бот находит действия «крупных игроков» (накопления, поглощения, тесты) "
+        f"и присылает сигналы с точным анализом и временем экспирации.\n\n"
+        f"Управляйте подпиской кнопками ниже:"
     )
-    update.message.reply_text(welcome_text, parse_mode='HTML', reply_markup=reply_markup)
+    update.message.reply_text(welcome_text, parse_mode='HTML', reply_markup=get_main_keyboard(True))
 
 def button_handler(update: Update, context: CallbackContext):
     query = update.callback_query
@@ -255,14 +385,15 @@ def button_handler(update: Update, context: CallbackContext):
     
     if query.data == 'enable':
         set_user_status(user_id, 1)
-        query.edit_message_text("✅ <b>Вы успешно подписались на сигналы!</b> Ожидайте уведомления.", parse_mode='HTML')
+        query.edit_message_text("✅ <b>VSA-сигналы включены!</b>", parse_mode='HTML', reply_markup=get_main_keyboard(True))
     elif query.data == 'disable':
         set_user_status(user_id, 0)
-        query.edit_message_text("🔕 <b>Уведомления отключены.</b> Вы можете включить их снова в любое время через /start.", parse_mode='HTML')
+        query.edit_message_text("🛑 <b>Бот остановлен.</b>", parse_mode='HTML', reply_markup=get_main_keyboard(False))
     elif query.data == 'status':
         active_users = get_active_users()
-        status_str = "АКТИВНА 🟢" if user_id in active_users else "ОТКЛЮЧЕНА 🔴"
-        query.edit_message_text(f"📋 <b>Ваш статус:</b> Подписка {status_str}", parse_mode='HTML')
+        is_active = user_id in active_users
+        status_str = "АКТИВНА 🟢" if is_active else "ОСТАНОВЛЕНА 🛑"
+        query.edit_message_text(f"📋 <b>Ваш статус:</b> {status_str}", parse_mode='HTML', reply_markup=get_main_keyboard(is_active))
 
 # ==================== ОСНОВНОЙ ЦИКЛ СКАНЕРА ====================
 def market_scanner_loop(bot: Bot):
@@ -274,16 +405,16 @@ def market_scanner_loop(bot: Bot):
         for symbol in SYMBOLS:
             try:
                 df = get_forex_klines(symbol, period='2d', interval=TIMEFRAME)
-                if df is None or len(df) < 200:
+                if df is None or len(df) < 60:
                     continue
                 
-                signal, rsi, price = analyze_market(df)
+                signal, price, reasons, poc, vah, val = analyze_vsa(df)
                 candle_time = df.index[-2]
                 
                 if signal and last_signals[symbol] != candle_time:
                     if not is_news_time(symbol):
-                        photo_path = generate_chart(df, symbol, signal)
-                        broadcast_signal(bot, symbol, signal, rsi, price, photo_path)
+                        photo_path = generate_chart(df, symbol, signal, poc, vah, val)
+                        broadcast_signal(bot, symbol, signal, price, photo_path, candle_time, reasons)
                         last_signals[symbol] = candle_time
                     
             except Exception as e:
@@ -291,12 +422,12 @@ def market_scanner_loop(bot: Bot):
                 
         time.sleep(CHECK_INTERVAL)
 
-# ==================== ФИКТИВНЫЙ ВЕБ-СЕРВЕР ДЛЯ RENDER ====================
+# ==================== ВЕБ-СЕРВЕР ДЛЯ RENDER ====================
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Бот сканера рынка активен и работает 24/7!"
+    return "Бот сканера VSA и Volume Profile активен 24/7!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -304,15 +435,12 @@ def run_flask():
 
 # ==================== ТОЧКА ВХОДА ====================
 if __name__ == '__main__':
-    # 1. Инициализация базы данных
     init_db()
     
-    # 2. Запуск веб-сервера в фоновом потоке
     t = threading.Thread(target=run_flask)
     t.daemon = True
     t.start()
     
-    # 3. Запуск Telegram-бота
     updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
     dp = updater.dispatcher
 
@@ -320,7 +448,6 @@ if __name__ == '__main__':
     dp.add_handler(CallbackQueryHandler(button_handler))
 
     updater.start_polling()
-    print("Бот и веб-сервер успешно запущены!")
+    print("Бот VSA & Volume Profile успешно запущен!")
 
-    # 4. Запуск бесконечного цикла сканера рынка
     market_scanner_loop(updater.bot)
