@@ -9,21 +9,25 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import telebot
+from flask import Flask
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from google import genai
 
 # ==================== НАСТРОЙКИ И КОНФИГУРАЦИЯ ====================
-BOT_TOKEN = "8996178345:AAElh6CIkk08qqP_90RyiVgxHjWrBiftKso"  # 👈 Замените на ваш токен Telegram
-CHANNEL_ID = "@your_channel_username"  # 👈 Замените на ваш канал или оставьте пустым ""
+# Получаем секреты из переменных окружения
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
 
 # Часовой пояс Астаны / Алматы (UTC+5)
 ASTANA_TZ = ZoneInfo("Asia/Almaty")
 
-# Тикеры для Yahoo Finance (Форекс пары имеют суффикс '=X')
+# Валютные пары Yahoo Finance (суффикс '=X')
 SYMBOLS = ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X", "EURGBP=X", "GBPJPY=X","AUDJPY=X","EURJPY=X", "GBPUSD=X"]
 
 NEWS_BUFFER_MINUTES = 30
 bot = telebot.TeleBot(BOT_TOKEN)
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Глобальные переменные
 high_impact_news = []
@@ -31,7 +35,18 @@ last_news_fetch_time = None
 registered_users = set()
 last_signals = {symbol: None for symbol in SYMBOLS}
 
-# ==================== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ ====================
+# ==================== FLASK СЕРВЕР (ДЛЯ RENDER WEB SERVICE) ====================
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "⚡ VSA Bot is running smoothly!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# ==================== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ И КОМАНДЫ ====================
 def get_active_users():
     users = list(registered_users)
     if CHANNEL_ID and CHANNEL_ID not in users:
@@ -45,20 +60,51 @@ def set_user_status(user_id, status):
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
     registered_users.add(message.chat.id)
-    bot.reply_to(
-        message, 
-        "👋 **Бот запущен и подключен к Yahoo Finance!**\n\n"
-        "Вы получаете сигналы на основе VSA, Volume Profile и мультитаймфреймового анализа (H1 + M5).\n"
-        "Часовой пояс: **Астана (UTC+5)**.",
-        parse_mode='Markdown'
+    text = (
+        "👋 <b>Добро пожаловать в VSA Analytics Bot!</b>\n\n"
+        "Система успешно подключена к котировкам и готова к сканированию рынка.\n\n"
+        "⚙️ <b>Параметры анализа:</b>\n"
+        "• <b>Стратегия:</b> VSA (Volume Spread Analysis) + Price Action\n"
+        "• <b>Таймфреймы:</b> H1 (Глобальный тренд) + M5 (Точка входа)\n"
+        "• <b>Индикаторы:</b> Volume Profile (POC/VAH/VAL), EMA 50\n"
+        "• <b>Часовой пояс:</b> Астана (UTC+5)\n"
+        "• <b>ИИ-Разбор:</b> Gemini AI (анализ убыточных сделок) 🧠\n\n"
+        "📌 <i>Сигналы будут поступать автоматически при появлении объёмных аномалий.</i>\n\n"
+        "Используйте /help для просмотра руководства по сигналам."
     )
+    bot.reply_to(message, text, parse_mode='HTML')
+
+@bot.message_handler(commands=['help'])
+def help_cmd(message):
+    text = (
+        "📖 <b>РУКОВОДСТВО ПО СИГНАЛАМ VSA</b>\n\n"
+        "🟢 <b>CALL (Покупка / Вверх):</b>\n"
+        "• <b>Stopping Volume:</b> Кульминация продаж. Огромный объем на падении — крупный игрок выкупает предложение.\n"
+        "• <b>No Supply:</b> Тест предложения. Маленький спред и мизерный объем — продавцов на рынке нет.\n\n"
+        "🔴 <b>PUT (Продажа / Вниз):</b>\n"
+        "• <b>Absorption High:</b> Остановка роста. Высокий объем на закрытии внизу свечи — лимитные продажи.\n"
+        "• <b>No Demand:</b> Отсутствие спроса. Слабый рост на маленьком объеме — покупатели иссякли.\n\n"
+        "🎯 <b>Уровни объема (POC):</b>\n"
+        "Желтая пунктирная линия на графике показывает максимальный накопленный объем. Отскоки от POC обладают максимальной точностью."
+    )
+    bot.reply_to(message, text, parse_mode='HTML')
+
+@bot.message_handler(commands=['status'])
+def status_cmd(message):
+    text = (
+        "🟢 <b>СИСТЕМА АКТИВНА</b>\n\n"
+        f"📊 <b>Отслеживаемые пары:</b> {', '.join([s.replace('=X', '') for s in SYMBOLS])}\n"
+        f"👥 <b>Подписчиков на сигналы:</b> {len(registered_users)}\n"
+        f"🛡️ <b>Новостной фильтр:</b> Работает\n"
+        f"🧠 <b>Gemini AI:</b> Готов к анализу"
+    )
+    bot.reply_to(message, text, parse_mode='HTML')
 
 # ==================== ПОЛУЧЕНИЕ КОТИРОВОК YAHOO FINANCE ====================
 def get_yahoo_klines(symbol, interval='5m', period='5d'):
-    # Делаем 3 попытки получить данные, если Yahoo временно заблокирует запрос
     for attempt in range(3):
         try:
-            time.sleep(1)  # Небольшая пауза перед запросом
+            time.sleep(1)  # Задержка перед запросом
             ticker = yf.Ticker(symbol)
             df = ticker.history(interval=interval, period=period)
             
@@ -81,7 +127,7 @@ def get_yahoo_klines(symbol, interval='5m', period='5d'):
                 
         except Exception as e:
             print(f"⚠️ Попытка {attempt + 1}/3 не удалась для {symbol}: {e}")
-            time.sleep(5)  # Ждем 5 секунд перед повторной попыткой
+            time.sleep(5)
             
     print(f"❌ Не удалось получить данные по {symbol} после 3 попыток.")
     return None
@@ -130,7 +176,7 @@ def fetch_economic_calendar():
 
 def is_news_time(symbol):
     if not high_impact_news: return False
-    clean_symbol = symbol[:3] # Например 'EUR' из 'EURUSD=X'
+    clean_symbol = symbol[:3]
     now_astana = datetime.now(ASTANA_TZ)
     buffer = timedelta(minutes=NEWS_BUFFER_MINUTES)
     
@@ -282,37 +328,75 @@ def analyze_vsa(df, symbol):
     exp_minutes = calculate_expiration(symbol, vol_rel, has_volume_level)
     return signal, close, reasons, poc_m5, vah_m5, val_m5, exp_minutes
 
+# ==================== ИИ-РАЗБОР ОШИБКИ (GEMINI) ====================
+def ask_ai_about_loss(symbol, signal_type, entry_price, exit_price, reasons, df_recent):
+    try:
+        candles_summary = ""
+        for idx, row in df_recent.iterrows():
+            candles_summary += f"- Time: {idx.strftime('%H:%M')}, O: {row['open']:.5f}, H: {row['high']:.5f}, L: {row['low']:.5f}, C: {row['close']:.5f}, Vol: {int(row['volume'])}\n"
+
+        prompt = (
+            f"Ты — опытный VSA и Price Action трейдер.\n"
+            f"Зафиксирован МИНУС по сигналу торгового бота на binary options.\n\n"
+            f"📌 Данные сделки:\n"
+            f"- Актив: {symbol}\n"
+            f"- Направление сигнала: {signal_type}\n"
+            f"- Цена входа: {entry_price:.5f}\n"
+            f"- Цена закрытия: {exit_price:.5f}\n"
+            f"- Логика входа: {', '.join(reasons)}\n\n"
+            f"📊 Последние свечи (M5):\n{candles_summary}\n"
+            f"Сделай краткий разбор (3-4 предложения):\n"
+            f"1. Почему сигнал оказался неверным?\n"
+            f"2. Какую анатомию свечи или аномалию объемов алгоритм мог упустить?\n"
+            f"Пиши четко, профессионально и с понятными трейдеру выводами."
+        )
+
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+        )
+        return response.text
+    except Exception as e:
+        print(f"⚠️ Ошибка обращения к Gemini AI: {e}")
+        return None
+
 # ==================== ГЕНЕРАЦИЯ ГРАФИКА ====================
 def generate_chart(df, symbol, poc, vah, val):
     plt.style.use('dark_background')
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), gridspec_kw={'height_ratios': [3, 1]}, sharex=True)
     
+    fig.patch.set_facecolor('#131722')
+    ax1.set_facecolor('#1e222d')
+    ax2.set_facecolor('#1e222d')
+    
     df_plot = df.iloc[-50:].copy()
 
     for i in range(len(df_plot)):
-        color = '#26a69a' if df_plot['close'].iloc[i] >= df_plot['open'].iloc[i] else '#ef5350'
-        ax1.plot([i, i], [df_plot['low'].iloc[i], df_plot['high'].iloc[i]], color=color, linewidth=1)
-        ax1.plot([i, i], [df_plot['open'].iloc[i], df_plot['close'].iloc[i]], color=color, linewidth=4)
-        ax2.bar(i, df_plot['volume'].iloc[i], color=color, alpha=0.8, width=0.6)
+        color = '#00E676' if df_plot['close'].iloc[i] >= df_plot['open'].iloc[i] else '#FF5252'
+        ax1.plot([i, i], [df_plot['low'].iloc[i], df_plot['high'].iloc[i]], color=color, linewidth=1.2)
+        ax1.plot([i, i], [df_plot['open'].iloc[i], df_plot['close'].iloc[i]], color=color, linewidth=4.5)
+        ax2.bar(i, df_plot['volume'].iloc[i], color=color, alpha=0.75, width=0.6)
 
     clean_name = symbol.replace('=X', '')
-    if poc: ax1.axhline(poc, color='#ffeb3b', linestyle='--', linewidth=1.5, label=f'POC: {poc:.5f}')
-    if vah: ax1.axhline(vah, color='#4caf50', linestyle=':', linewidth=1, label=f'VAH: {vah:.5f}')
-    if val: ax1.axhline(val, color='#f44336', linestyle=':', linewidth=1, label=f'VAL: {val:.5f}')
+    
+    if poc: ax1.axhline(poc, color='#FFD700', linestyle='--', linewidth=1.8, label=f'🎯 POC (Макс. объём): {poc:.5f}')
+    if vah: ax1.axhline(vah, color='#00E676', linestyle=':', linewidth=1.2, label=f'🟢 VAH (Верх зоны): {vah:.5f}')
+    if val: ax1.axhline(val, color='#FF5252', linestyle=':', linewidth=1.2, label=f'🔴 VAL (Низ зоны): {val:.5f}')
 
-    ax1.set_title(f"Yahoo Finance: {clean_name} [M5] - VSA Chart", fontsize=14, color='white', pad=10)
-    ax1.grid(True, color='#2a2e39', linestyle='--', alpha=0.5)
-    ax1.legend(loc='upper left', facecolor='#1e222d', edgecolor='none')
-    ax2.grid(True, color='#2a2e39', linestyle='--', alpha=0.5)
+    ax1.set_title(f"⚡ VSA POWER SCANNER | {clean_name} [M5] ⚡", fontsize=15, color='#FFFFFF', fontweight='bold', pad=12)
+    ax1.grid(True, color='#2a2e39', linestyle='--', alpha=0.4)
+    ax1.legend(loc='upper left', facecolor='#1e222d', edgecolor='#363c4e', labelcolor='white', fontsize=10)
+    ax2.grid(True, color='#2a2e39', linestyle='--', alpha=0.4)
+    ax2.set_ylabel("Volume", color='#848e9c', fontsize=10)
 
     plt.tight_layout()
     chart_path = f"chart_{clean_name}.png"
-    plt.savefig(chart_path, dpi=150, bbox_inches='tight')
+    plt.savefig(chart_path, dpi=160, bbox_inches='tight', facecolor=fig.get_facecolor())
     plt.close()
     return chart_path
 
 # ==================== ФОНОВАЯ ПРОВЕРКА РЕЗУЛЬТАТА ====================
-def check_trade_result(bot, chat_ids, symbol, signal_type, entry_price, exp_minutes):
+def check_trade_result(bot, chat_ids, symbol, signal_type, entry_price, exp_minutes, reasons):
     sleep_seconds = (exp_minutes * 60) + 15
     time.sleep(sleep_seconds)
     
@@ -324,19 +408,28 @@ def check_trade_result(bot, chat_ids, symbol, signal_type, entry_price, exp_minu
         
         is_call = "CALL" in signal_type
         is_win = (exit_price > entry_price) if is_call else (exit_price < entry_price)
-            
-        result_emoji = "✅ ПРОФИТ (ПЛЮС)" if is_win else "❌ МИНУС"
+        
         multiplier = 1000 if 'JPY' in symbol else 100000
         diff_pips = (exit_price - entry_price) * multiplier if is_call else (entry_price - exit_price) * multiplier
-        
         clean_name = symbol.replace('=X', '')
+
+        if is_win:
+            result_header = "🎉💰 <b>ОТЛИЧНЫЙ ПРОФИТ! СДЕЛАНО!</b> 💰🎉"
+            status_text = f"🏆 <b>ИТОГ: УВЕРЕННЫЙ ПЛЮС (+{diff_pips:.1f} п.)</b> 🟢"
+            footer_note = "🔥 Отличная отработка объёмов! Продолжаем в том же духе!"
+        else:
+            result_header = "😅📉 <b>УПС... РЫНОК ОКАЗАЛСЯ СИЛЬНЕЕ</b> 📉"
+            status_text = f"❌ <b>ИТОГ: МИНУС ({diff_pips:.1f} п.)</b> 🔴"
+            footer_note = "🧠 <i>Отправляю запрос в Gemini AI для разбора ошибки...</i>"
+        
         result_text = (
-            f"📊 <b>РЕЗУЛЬТАТ СДЕЙКИ (#{clean_name})</b>\n\n"
-            f"<b>Сигнал:</b> {signal_type}\n"
-            f"<b>Вход:</b> {entry_price:.5f}\n"
-            f"<b>Выход:</b> {exit_price:.5f}\n"
-            f"<b>Разница:</b> {diff_pips:+.1f} п.\n\n"
-            f"<b>Итог:</b> {result_emoji}"
+            f"{result_header}\n\n"
+            f"📊 <b>Пара:</b> #{clean_name}\n"
+            f"🎬 <b>Направление:</b> {signal_type}\n"
+            f"🏁 <b>Цена входа:</b> <code>{entry_price:.5f}</code>\n"
+            f"🏁 <b>Цена выхода:</b> <code>{exit_price:.5f}</code>\n\n"
+            f"{status_text}\n\n"
+            f"{footer_note}"
         )
         
         for user_id in chat_ids:
@@ -345,6 +438,22 @@ def check_trade_result(bot, chat_ids, symbol, signal_type, entry_price, exp_minu
                 time.sleep(0.05)
             except Exception as e:
                 if "bot was blocked" in str(e).lower(): set_user_status(user_id, 0)
+
+        # Разбор ИИ при минусе
+        if not is_win:
+            ai_analysis = ask_ai_about_loss(clean_name, signal_type, entry_price, exit_price, reasons, df.tail(5))
+            if ai_analysis:
+                ai_message = (
+                    f"🧠 <b>РАЗБОР ОШИБКИ ОТ GEMINI AI</b> 🤖\n\n"
+                    f"{ai_analysis}\n\n"
+                    f"💡 <i>Учитывай эту анатомию свечи в следующих сделках!</i>"
+                )
+                for user_id in chat_ids:
+                    try:
+                        bot.send_message(chat_id=user_id, text=ai_message, parse_mode='HTML')
+                        time.sleep(0.05)
+                    except Exception as e:
+                        pass
                     
     except Exception as e:
         print(f"⚠️ Ошибка проверки результата для {symbol}: {e}")
@@ -361,17 +470,24 @@ def broadcast_signal(bot, symbol, signal_type, price, photo_path, candle_time, r
     exp_time = (candle_astana + timedelta(minutes=exp_minutes + 5)).strftime('%H:%M (Астана)')
     
     clean_name = symbol.replace('=X', '')
-    reasons_formatted = "\n".join([r if r.startswith('\n') or r.startswith('📈') or r.startswith('📉') else f"• {r}" for r in reasons])
+    reasons_formatted = "\n".join([r if r.startswith('\n') or r.startswith('📈') or r.startswith('📉') else f"  • {r}" for r in reasons])
+
+    if "CALL" in signal_type:
+        header_emoji = "🚀🔥 <b>СИГНАЛ НА ПОКУПКУ (CALL)!</b> 🔥🚀"
+        action_badge = "🟢 <b>ВХОД ВВЕРХ (CALL)</b>"
+    else:
+        header_emoji = "💥📉 <b>СИГНАЛ НА ПРОДАЖУ (PUT)!</b> 📉💥"
+        action_badge = "🔴 <b>ВХОД ВНИЗ (PUT)</b>"
 
     caption = (
-        f"🚨 <b>УМНЫЙ СИГНАЛ VSA (Yahoo Finance)</b> 🚨\n\n"
-        f"<b>Пара:</b> #{clean_name}\n"
-        f"<b>Направление:</b> {signal_type}\n"
-        f"<b>Цена входа:</b> {price:.5f}\n"
-        f"⏱ <b>Экспирация:</b> до <code>{exp_time}</code> (<b>на {exp_minutes} минут</b>)\n\n"
-        f"📊 <b>Детали анализа:</b>\n{reasons_formatted}\n\n"
-        f"🛡️ <i>Новостной фильтр: Активен</i>"
-    ).sleep
+        f"{header_emoji}\n\n"
+        f"💎 <b>Актив:</b> <code>#{clean_name}</code>\n"
+        f"🎯 <b>Действие:</b> {action_badge}\n"
+        f"📍 <b>Точка входа:</b> <code>{price:.5f}</code>\n"
+        f"⏳ <b>Время экспирации:</b> <b>{exp_minutes} МИНУТ</b> (до <code>{exp_time}</code>)\n\n"
+        f"🧠 <b>ГЛУБОКАЯ АНАЛИТИКА:</b>\n{reasons_formatted}\n\n"
+        f"⚡ <i>Следите за рисками и открывайте сделку строго на новой свече!</i> 🔥"
+    )
     
     for user_id in active_users:
         try:
@@ -383,22 +499,21 @@ def broadcast_signal(bot, symbol, signal_type, price, photo_path, candle_time, r
             
     if os.path.exists(photo_path): os.remove(photo_path)
 
-    # Фоновая проверка
     thread = threading.Thread(
         target=check_trade_result,
-        args=(bot, active_users, symbol, signal_type, price, exp_minutes)
+        args=(bot, active_users, symbol, signal_type, price, exp_minutes, reasons)
     )
     thread.daemon = True
     thread.start()
 
-# ==================== ЦИКЛ СКАНИРОВАНИЯ ====================
+# ==================== ЦИКЛ СКАНИРОВАНИЯ РЫНКА ====================
 def market_scanner_loop():
     while True:
         try:
             fetch_economic_calendar()
 
             for symbol in SYMBOLS:
-                df = get_yahoo_klines(symbol, interval='5m', period='2d') # M5
+                df = get_yahoo_klines(symbol, interval='5m', period='2d')
                 if df is None or len(df) < 30:
                     continue
 
@@ -412,17 +527,23 @@ def market_scanner_loop():
                         last_signals[symbol] = candle_time
 
         except Exception as e:
-            print(f"⚠️ Ошибка в сканере рынка: {e}")
+            print(f"⚠️ Ошибка сканера рынка: {e}")
 
-        time.sleep(60)  # Вместо 30
+        time.sleep(60)
 
-# ==================== ЗАПУСК БОТА ====================
+# ==================== ЗАПУСК ПРИЛОЖЕНИЯ ====================
 if __name__ == "__main__":
-    print("🚀 Запуск VSA-бота (Yahoo Finance)...")
+    print("🚀 Запуск VSA-бота и веб-сервера...")
     
+    # Запуск Flask на фоновом потоке
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    # Запуск сканера рынка
     scanner_thread = threading.Thread(target=market_scanner_loop)
     scanner_thread.daemon = True
     scanner_thread.start()
 
-    print("🤖 Telegram бот запущен и слушает команды...")
+    print("🤖 Telegram бот запущен...")
     bot.infinity_polling()
