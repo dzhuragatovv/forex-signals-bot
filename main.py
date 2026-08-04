@@ -372,11 +372,20 @@ if __name__ == "__main__":
     scanner_thread = threading.Thread(target=market_scanner_loop, daemon=True)
     scanner_thread.start()
 
-    # 3. Устойчивый запуск Telegram Polling
+    # 3. Принудительный сброс старых соединений Telegram
+    print("🧹 Очистка старых сессий Telegram...")
+    try:
+        bot.remove_webhook()
+        time.sleep(2)
+    except Exception as e:
+        print(f"Ошибка при сбросе вебхука: {e}")
+
+    # 4. Устойчивый запуск Telegram Polling
     print("🤖 Telegram бот запущен и слушает команды...")
     while True:
         try:
-            bot.polling(none_stop=True, interval=2, timeout=30)
+            # skip_pending=True отбрасывает накопившиеся за время офлайна команды, исключая флуд
+            bot.polling(none_stop=True, interval=2, timeout=30, skip_pending=True)
         except Exception as e:
             print(f"⚠️ Ошибка соединения Telegram polling: {e}")
             time.sleep(5)
