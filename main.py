@@ -24,7 +24,7 @@ except ImportError:
 
 BOT_TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
-CHAT_ID = os.environ.get('CHAT_ID', '')  # Если не задан, бот ответит в команде
+CHAT_ID = os.environ.get('CHAT_ID', '')  # Ваш ID или ID группы/канала
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -34,7 +34,7 @@ if HAS_GEMINI and GEMINI_API_KEY:
 else:
     gemini_model = None
 
-# Список из 11 валютных пар (5 базовых + 6 новых)
+# Список из 11 валютных пар
 SYMBOLS = [
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X",
     "EURGBP=X", "EURJPY=X", "GBPJPY=X", "AUDJPY=X", "NZDUSD=X", "EURAUD=X"
@@ -62,7 +62,7 @@ def fetch_data(symbol, period="7d", interval="5m"):
             return None
         return df
     except Exception as e:
-        print(f"Ошибка загрузки данных для {symbol}: {e}")
+        print(f"❌ Ошибка загрузки данных для {symbol}: {e}")
         return None
 
 def calculate_h1_poc_and_ema(symbol):
@@ -83,8 +83,7 @@ def calculate_h1_poc_and_ema(symbol):
     return current_ema, h1_poc
 
 def is_news_time(symbol):
-    """Сокращенный новостной фильтр (15 мин до / 15 мин после)."""
-    # Буфер новостей 15 минут
+    """Буфер новостей 15 минут."""
     return False
 
 
@@ -137,13 +136,16 @@ def calculate_volume_profile(df, bins_count=24):
 # ==================== ЯДРО VSA АНАЛИЗА ====================
 
 def analyze_vsa(symbol):
-    """Анализ VSA свечей M5 с учетом ослабленного H1 фильтра."""
+    """Анализ VSA свечей M5 с подробным логированием результатов."""
+    clean_sym = symbol.replace("=X", "")
     df_m5 = fetch_data(symbol, period="2d", interval="5m")
     if df_m5 is None or len(df_m5) < 30:
+        print(f"⚠️ Мало данных M5 для {clean_sym}")
         return None
 
     h1_ema50, h1_poc = calculate_h1_poc_and_ema(symbol)
     if h1_ema50 is None or h1_poc is None:
+        print(f"⚠️ Не удалось рассчитать H1 метрики для {clean_sym}")
         return None
 
     candle = df_m5.iloc[-2]
@@ -159,7 +161,7 @@ def analyze_vsa(symbol):
 
     close_ratio = (close_p - low_p) / spread if spread > 0 else 0.5
 
-    # Порог объема скорректирован до 1.5x для регулярного поиска сигналов
+    # Поиск VSA Паттернов (порог 1.5x)
     pattern = None
     if close_p < open_p and vol_rel >= 1.5 and close_ratio >= 0.5:
         pattern = "Stopping Volume"
@@ -171,13 +173,14 @@ def analyze_vsa(symbol):
         pattern = "No Demand"
 
     if not pattern:
+        print(f"ℹ️ [{clean_sym}] Паттерн VSA не обнаружен (Объем: {vol_rel:.2f}x)")
         return None
 
     current_price = df_m5['Close'].iloc[-1]
 
     # --- Ослабленный H1 фильтр (разрешены отскоки от H1 POC) ---
     poc_distance_pct = abs(current_price - h1_poc) / current_price * 100
-    is_near_h1_poc = poc_distance_pct <= 0.08  # Касание POC H1 (0.08%)
+    is_near_h1_poc = poc_distance_pct <= 0.08
 
     is_h1_uptrend = current_price > h1_ema50
     is_h1_downtrend = current_price < h1_ema50
@@ -187,9 +190,18 @@ def analyze_vsa(symbol):
     if pattern in ["Stopping Volume", "No Supply"]:
         if is_h1_uptrend or is_near_h1_poc:
             signal = "CALL"
+            if not is_h1_uptrend and is_near_h1_poc:
+                print(f"🎯 [{clean_sym}] Контртрендовый CALL пропущен по отскоку от H1 POC")
+        else:
+            print(f"⛔ [{clean_sym}] CALL отклонен: Против тренда H1 и далеко от POC")
+
     elif pattern in ["Absorption High", "No Demand"]:
         if is_h1_downtrend or is_near_h1_poc:
             signal = "PUT"
+            if not is_h1_downtrend and is_near_h1_poc:
+                print(f"🎯 [{clean_sym}] Контртрендовый PUT пропущен по отскоку от H1 POC")
+        else:
+            print(f"⛔ [{clean_sym}] PUT отклонен: Против тренда H1 и далеко от POC")
 
     if not signal:
         return None
@@ -205,7 +217,7 @@ def analyze_vsa(symbol):
     poc_m5, vah_m5, val_m5, bins_m5, vol_prof_m5 = calculate_volume_profile(df_m5.tail(48))
 
     return {
-        "symbol": symbol.replace("=X", ""),
+        "symbol": clean_sym,
         "full_symbol": symbol,
         "signal": signal,
         "pattern": pattern,
@@ -222,17 +234,16 @@ def analyze_vsa(symbol):
     }
 
 
-# ==================== ОТРИСОВКА И ИИ АНАЛИЗ ====================
+# ==================== ОТРИСОВКА И ОТПРАВКА СИГНАЛА ====================
 
 def plot_vsa_chart(data, filepath):
-    """Отрисовка детального VSA графика с Volume Profile."""
+    """Отрисовка VSA графика."""
     df = data['df_m5']
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), gridspec_kw={'height_ratios': [3, 1]})
     fig.patch.set_facecolor('#131722')
     ax1.set_facecolor('#131722')
     ax2.set_facecolor('#131722')
 
-    # Отрисовка свечей
     for i in range(len(df)):
         open_p, high_p, low_p, close_p = df['Open'].iloc[i], df['High'].iloc[i], df['Low'].iloc[i], df['Close'].iloc[i]
         color = '#26a69a' if close_p >= open_p else '#ef5350'
@@ -242,7 +253,6 @@ def plot_vsa_chart(data, filepath):
         rect = patches.Rectangle((i - 0.3, rect_bottom), 0.6, rect_height, facecolor=color, edgecolor=color)
         ax1.add_patch(rect)
 
-    # Уровни POC
     ax1.axhline(y=data['h1_poc'], color='#ffd700', linestyle='--', linewidth=1.5, label=f"H1 POC ({data['h1_poc']:.5f})")
     ax1.axhline(y=data['poc_m5'], color='#2196f3', linestyle=':', linewidth=1.2, label=f"M5 POC ({data['poc_m5']:.5f})")
 
@@ -251,7 +261,6 @@ def plot_vsa_chart(data, filepath):
     ax1.grid(True, color='#2a2e39', alpha=0.5)
     ax1.legend(loc='upper left', facecolor='#1e222d', edgecolor='none', labelcolor='white')
 
-    # Объемы
     colors_vol = ['#26a69a' if df['Close'].iloc[i] >= df['Open'].iloc[i] else '#ef5350' for i in range(len(df))]
     ax2.bar(range(len(df)), df['Volume'], color=colors_vol, alpha=0.8)
     ax2.tick_params(colors='white')
@@ -261,28 +270,8 @@ def plot_vsa_chart(data, filepath):
     plt.savefig(filepath, dpi=140, bbox_inches='tight', facecolor=fig.get_facecolor())
     plt.close()
 
-def analyze_loss_with_gemini(data, exit_price):
-    """ИИ Анализ убыточной сделки через Gemini AI."""
-    if not gemini_model:
-        return "ИИ модуль не подсоединен или отсутствует API ключ."
-
-    prompt = (
-        f"Проведи глубокий VSA-разбор убыточной сделки:\n"
-        f"Пара: {data['symbol']}\n"
-        f"Сигнал: {data['signal']} ({data['pattern']})\n"
-        f"Цена входа: {data['price']}, Цена закрытия: {exit_price}\n"
-        f"Относительный объем: {data['vol_rel']}x, Спред: {data['spread_rel']}x\n"
-        f"H1 POC: {data['h1_poc']}\n\n"
-        f"Объясни в 3 коротких пунктах: почему сделка закрылась в минус и какую аномалию объемов мы упустили?"
-    )
-    try:
-        response = gemini_model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        return f"Ошибка ИИ анализа: {e}"
-
 def generate_and_send_signal(data):
-    """Формирование и отправка VSA сигнала в Telegram."""
+    """Формирование и отправка VSA сигнала."""
     clean_symbol = data['symbol']
     signal_emoji = "🟢 CALL (ВВЕРХ)" if data['signal'] == "CALL" else "🔴 PUT (ВНИЗ)"
     
@@ -304,32 +293,43 @@ def generate_and_send_signal(data):
         if CHAT_ID:
             with open(chart_path, 'rb') as photo:
                 bot.send_photo(CHAT_ID, photo, caption=msg_text, parse_mode='Markdown')
-        print(f"✅ Сигнал отправлен для {clean_symbol}")
+            print(f"✅ Сигнал успешно отправлен в Telegram для {clean_symbol}")
+        else:
+            print(f"⚠️ Сигнал найден для {clean_symbol}, но переменная CHAT_ID не задана!")
     except Exception as e:
-        print(f"Ошибка отправки сообщения: {e}")
+        print(f"❌ Ошибка отправки сообщения в Telegram: {e}")
     finally:
         if os.path.exists(chart_path):
             os.remove(chart_path)
 
 
-# ==================== СКАНИРОВАНИЕ РЫНКА И ПРОВЕРКА ====================
+# ==================== СКАНИРОВАНИЕ РЫНКА (ПУНКТ 2) ====================
 
 def market_scanner_loop():
-    """Сканирование 11 валютных пар каждые 60 секунд."""
+    """Фоновый цикл сканирования с подробными логами."""
+    print("✅ Фоновый сканер VSA успешно запущен!")
+    time.sleep(5)  # Пауза перед первым циклом
+    
     while True:
         try:
+            now_str = datetime.now().strftime('%H:%M:%S')
+            print(f"\n🔍 [{now_str}] Начало анализа 11 валютных пар...")
+            
             for symbol in SYMBOLS:
                 if is_news_time(symbol):
+                    print(f"📰 [{symbol}] Пропущен из-за новостного фильтра")
                     continue
 
                 signal_data = analyze_vsa(symbol)
                 if signal_data:
                     generate_and_send_signal(signal_data)
                 
-                time.sleep(2)
+                time.sleep(1.5)
+
+            print(f"💤 [{datetime.now().strftime('%H:%M:%S')}] Сканирование завершено. Пауза 60 секунд...")
 
         except Exception as e:
-            print(f"Ошибка в цикле сканера: {e}")
+            print(f"❌ Ошибка внутри цикла сканера: {e}")
 
         time.sleep(60)
 
@@ -359,7 +359,7 @@ def send_status(message):
     bot.reply_to(message, status_text, parse_mode='Markdown')
 
 
-# ==================== ЗАПУСК ПРИЛОЖЕНИЯ ====================
+# ==================== ЗАПУСК ПРИЛОЖЕНИЯ (ПУНКТ 1) ====================
 
 if __name__ == "__main__":
     print("🚀 Запуск VSA-бота и веб-сервера...")
@@ -368,24 +368,29 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # 2. Запуск фонового сканера рынка
+    # 2. Запуск фонового сканера рынка (СТРОГО ДО BOT.POLLING!)
     scanner_thread = threading.Thread(target=market_scanner_loop, daemon=True)
     scanner_thread.start()
 
-    # 3. Принудительный сброс старых соединений Telegram
-    print("🧹 Очистка старых сессий Telegram...")
+    # 3. Сброс зависших сессий Telegram
     try:
         bot.remove_webhook()
         time.sleep(2)
     except Exception as e:
-        print(f"Ошибка при сбросе вебхука: {e}")
+        print(f"Сброс вебхука: {e}")
 
     # 4. Устойчивый запуск Telegram Polling
     print("🤖 Telegram бот запущен и слушает команды...")
     while True:
         try:
-            # skip_pending=True отбрасывает накопившиеся за время офлайна команды, исключая флуд
             bot.polling(none_stop=True, interval=2, timeout=30, skip_pending=True)
+        except telebot.apihelper.ApiTelegramException as e:
+            if e.error_code == 409:
+                print("⚠️ Пауза 10 сек из-за перезапуска контейнера (409 Conflict)...")
+                time.sleep(10)
+            else:
+                print(f"⚠️ Ошибка Telegram API: {e}")
+                time.sleep(5)
         except Exception as e:
-            print(f"⚠️ Ошибка соединения Telegram polling: {e}")
+            print(f"⚠️ Ошибка соединения: {e}")
             time.sleep(5)
