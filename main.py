@@ -531,23 +531,47 @@ def market_scanner_loop():
 
         time.sleep(60)
 
+# ==================== ХЭНДЛЕРЫ КОМАНД TELEGRAM ====================
+
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    welcome_text = (
+        "🤖 **VSA Trading Bot активен!**\n\n"
+        "Я непрерывно анализирую рынок по методу VSA (Volume Spread Analysis) "
+        "и отправляю проверенные сигналы с графиками Volume Profile.\n\n"
+        "📍 Команда /status — проверить статус работы сканера."
+    )
+    bot.reply_to(message, welcome_text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['status'])
+def send_status(message):
+    status_text = (
+        "🟢 **СИСТЕМА АКТИВНА И РАБОТАЕТ**\n"
+        f"📊 **Отслеживаемые пары:** {', '.join(SYMBOLS)}\n"
+        "⏱️ **Таймфреймы:** M5 (сигналы) / H1 (тренд)\n"
+        "🛡️ **Фильтры:** VSA + Volume Profile + H1 Trend + News"
+    )
+    bot.reply_to(message, status_text, parse_mode='Markdown')
+
+
 # ==================== ЗАПУСК ПРИЛОЖЕНИЯ ====================
+
 if __name__ == "__main__":
     print("🚀 Запуск VSA-бота и веб-сервера...")
     
-    # 1. Запуск Flask на фоновом потоке
+    # 1. Запуск Flask (Health Check для Render)
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # 2. Запуск сканера рынка на фоновом потоке
+    # 2. Запуск фонового сканера рынка
     scanner_thread = threading.Thread(target=market_scanner_loop, daemon=True)
     scanner_thread.start()
 
-    # 3. Запуск опроса Telegram API с защитой от сбоев в основном потоке
+    # 3. Основной цикл TeleBot с авто-переподключением и таймаутами
     print("🤖 Telegram бот запущен и слушает команды...")
     while True:
         try:
-            bot.polling(none_stop=True, interval=1, timeout=60)
+            bot.polling(none_stop=True, interval=2, timeout=30)
         except Exception as e:
-            print(f"⚠️ Сбой поллинга Telegram: {e}")
+            print(f"⚠️ Ошибка соединения Telegram polling: {e}")
             time.sleep(5)
