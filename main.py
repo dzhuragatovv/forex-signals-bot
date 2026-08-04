@@ -535,15 +535,19 @@ def market_scanner_loop():
 if __name__ == "__main__":
     print("🚀 Запуск VSA-бота и веб-сервера...")
     
-    # Запуск Flask на фоновом потоке
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
+    # 1. Запуск Flask на фоновом потоке
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # Запуск сканера рынка
-    scanner_thread = threading.Thread(target=market_scanner_loop)
-    scanner_thread.daemon = True
+    # 2. Запуск сканера рынка на фоновом потоке
+    scanner_thread = threading.Thread(target=market_scanner_loop, daemon=True)
     scanner_thread.start()
 
-    print("🤖 Telegram бот запущен...")
-    bot.infinity_polling()
+    # 3. Запуск опроса Telegram API с защитой от сбоев в основном потоке
+    print("🤖 Telegram бот запущен и слушает команды...")
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=1, timeout=60)
+        except Exception as e:
+            print(f"⚠️ Сбой поллинга Telegram: {e}")
+            time.sleep(5)
