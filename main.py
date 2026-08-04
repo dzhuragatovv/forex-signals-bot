@@ -359,38 +359,46 @@ def send_status(message):
     bot.reply_to(message, status_text, parse_mode='Markdown')
 
 
-# ==================== ЗАПУСК ПРИЛОЖЕНИЯ (ПУНКТ 1) ====================
+# ==================== АВТОЗАПУСК ПОТОКОВ ====================
 
-if __name__ == "__main__":
-    print("🚀 Запуск VSA-бота и веб-сервера...")
+def start_bot_services():
+    print("🚀 Инициализация фоновых служб VSA-бота...")
     
-    # 1. Запуск Flask (Health Check для Render)
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-
-    # 2. Запуск фонового сканера рынка (СТРОГО ДО BOT.POLLING!)
-    scanner_thread = threading.Thread(target=market_scanner_loop, daemon=True)
-    scanner_thread.start()
-
-    # 3. Сброс зависших сессий Telegram
+    # Сброс старых вебхуков Telegram
     try:
         bot.remove_webhook()
         time.sleep(2)
     except Exception as e:
         print(f"Сброс вебхука: {e}")
 
-    # 4. Устойчивый запуск Telegram Polling
-    print("🤖 Telegram бот запущен и слушает команды...")
-    while True:
-        try:
-            bot.polling(none_stop=True, interval=2, timeout=30, skip_pending=True)
-        except telebot.apihelper.ApiTelegramException as e:
-            if e.error_code == 409:
-                print("⚠️ Пауза 10 сек из-за перезапуска контейнера (409 Conflict)...")
-                time.sleep(10)
-            else:
-                print(f"⚠️ Ошибка Telegram API: {e}")
+    # Запуск сканера рынка в отдельном потоке
+    scanner_thread = threading.Thread(target=market_scanner_loop, daemon=True)
+    scanner_thread.start()
+    print("✅ Фоновый поток сканера рынка запущен!")
+
+    # Запуск поллинга Telegram в отдельном потоке
+    def start_polling():
+        print("🤖 Telegram бот запущен и слушает команды...")
+        while True:
+            try:
+                bot.polling(none_stop=True, interval=2, timeout=30, skip_pending=True)
+            except telebot.apihelper.ApiTelegramException as e:
+                if e.error_code == 409:
+                    print("⚠️ Пауза 10 сек из-за дубликата сессии (409 Conflict)...")
+                    time.sleep(10)
+                else:
+                    print(f"⚠️ Ошибка Telegram API: {e}")
+                    time.sleep(5)
+            except Exception as e:
+                print(f"⚠️ Ошибка соединения polling: {e}")
                 time.sleep(5)
-        except Exception as e:
-            print(f"⚠️ Ошибка соединения: {e}")
-            time.sleep(5)
+
+    polling_thread = threading.Thread(target=start_polling, daemon=True)
+    polling_thread.start()
+
+# Вызываем автозапуск при импорте файла хостингом
+start_bot_services()
+
+if __name__ == "__main__":
+    # Если запуск идет напрямую через python main.py
+    run_flask()
